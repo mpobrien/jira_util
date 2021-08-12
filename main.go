@@ -4,6 +4,8 @@ import (
 	"crypto/x509"
 	"encoding/json"
 	"encoding/pem"
+	"errors"
+	"flag"
 	"fmt"
 	"io/ioutil"
 	"log"
@@ -14,55 +16,59 @@ import (
 	"path/filepath"
 	"regexp"
 	"strings"
+	"text/tabwriter"
 
 	"github.com/andygrunwald/go-jira"
 	"github.com/dghubble/oauth1"
+	"github.com/mitchellh/cli"
 	"golang.org/x/net/context"
 )
 
 var jiraURL = "https://jira.mongodb.org/"
 
-const jiraPrivateKey = `-----BEGIN RSA PRIVATE KEY-----
-put the key here
------END RSA PRIVATE KEY-----`
-
-const jiraConsumerKey = "put the consumer key here"
-
-func getJIRAHTTPClient(ctx context.Context, config *oauth1.Config) *http.Client {
+func jiraHTTPClient(ctx context.Context, config *oauth1.Config) (*http.Client, error) {
 	cacheFile, err := jiraTokenCacheFile()
 	if err != nil {
-		log.Fatalf("Unable to get path to cached credential file. %v", err)
+		return nil, fmt.Errorf("unable to get path to cached credential file: %v", err)
 	}
 	tok, err := jiraTokenFromFile(cacheFile)
 	if err != nil {
-		tok = getJIRATokenFromWeb(config)
-		saveJIRAToken(cacheFile, tok)
+		// cached token not available, prompt for auth code
+		tok, err = jiraTokenFromWeb(config)
+		if err != nil {
+			return nil, fmt.Errorf("unable to get token from web: %v", err)
+		}
+		if err := saveJIRAToken(cacheFile, tok); err != nil {
+			return nil, fmt.Errorf("unable to save token to cache file: %v", err)
+		}
 	}
-	return config.Client(ctx, tok)
+	return config.Client(ctx, tok), nil
 }
 
-func getJIRATokenFromWeb(config *oauth1.Config) *oauth1.Token {
+func jiraTokenFromWeb(config *oauth1.Config) (*oauth1.Token, error) {
 	requestToken, requestSecret, err := config.RequestToken()
 	if err != nil {
-		log.Fatalf("Unable to get request token. %v", err)
+		return nil, fmt.Errorf("unable to get request token: %v", err)
 	}
 	authorizationURL, err := config.AuthorizationURL(requestToken)
 	if err != nil {
-		log.Fatalf("Unable to get authorization url. %v", err)
+		return nil, fmt.Errorf("unable to get authorization url: %v", err)
 	}
-	fmt.Printf("Go to the following link in your browser then type the "+
-		"authorization code: \n%v\n", authorizationURL.String())
+
+	fmt.Println("Load the following link in your browser, then copy the authorization code and paste it below:")
+	fmt.Println(authorizationURL.String())
+	fmt.Printf("Authorization code: ")
 
 	var code string
 	if _, err := fmt.Scan(&code); err != nil {
-		log.Fatalf("Unable to read authorization code. %v", err)
+		return nil, fmt.Errorf("unable to read authorization code: %v", err)
 	}
 
 	accessToken, accessSecret, err := config.AccessToken(requestToken, requestSecret, code)
 	if err != nil {
-		log.Fatalf("Unable to get access token. %v", err)
+		return nil, fmt.Errorf("unable to get access token: %v", err)
 	}
-	return oauth1.NewToken(accessToken, accessSecret)
+	return oauth1.NewToken(accessToken, accessSecret), nil
 }
 
 func jiraTokenCacheFile() (string, error) {
@@ -71,9 +77,10 @@ func jiraTokenCacheFile() (string, error) {
 		return "", err
 	}
 	tokenCacheDir := filepath.Join(usr.HomeDir, ".credentials")
-	os.MkdirAll(tokenCacheDir, 0700)
-	return filepath.Join(tokenCacheDir,
-		url.QueryEscape(jiraURL+".json")), err //TODO
+	if err := os.MkdirAll(tokenCacheDir, 0700); err != nil {
+		return "", fmt.Errorf("failed to create credentials dir '%s': %v", tokenCacheDir, err)
+	}
+	return filepath.Join(tokenCacheDir, url.QueryEscape(jiraURL+".json")), err
 }
 
 func jiraTokenFromFile(file string) (*oauth1.Token, error) {
@@ -87,29 +94,33 @@ func jiraTokenFromFile(file string) (*oauth1.Token, error) {
 	return t, err
 }
 
-func saveJIRAToken(file string, token *oauth1.Token) {
-	fmt.Printf("Saving credential file to: %s\n", file)
+func saveJIRAToken(file string, token *oauth1.Token) error {
 	f, err := os.OpenFile(file, os.O_RDWR|os.O_CREATE|os.O_TRUNC, 0600)
 	if err != nil {
-		log.Fatalf("Unable to cache oauth token: %v", err)
+		return fmt.Errorf("Unable to cache oauth token: %v", err)
 	}
 	defer f.Close()
-	json.NewEncoder(f).Encode(token)
+	return json.NewEncoder(f).Encode(token)
 }
 
-func getJIRAClient() *jira.Client {
+func jiraClient(pkFilePath string, jiraConsumerKey string) (*jira.Client, error) {
+	jiraPrivateKey, err := ioutil.ReadFile(pkFilePath)
+	if err != nil {
+		return nil, fmt.Errorf("failed to read private key file '%v': %v", pkFilePath, err)
+	}
+
 	ctx := context.Background()
 	keyDERBlock, _ := pem.Decode([]byte(jiraPrivateKey))
 	if keyDERBlock == nil {
-		log.Fatal("unable to decode key PEM block")
+		return nil, errors.New("unable to decode key PEM block")
 	}
 	if !(keyDERBlock.Type == "PRIVATE KEY" || strings.HasSuffix(keyDERBlock.Type, " PRIVATE KEY")) {
-		log.Fatalf("unexpected key DER block type: %s", keyDERBlock.Type)
+		return nil, fmt.Errorf("unexpected key DER block type: %s", keyDERBlock.Type)
 	}
 
 	privateKey, err := x509.ParsePKCS1PrivateKey(keyDERBlock.Bytes)
 	if err != nil {
-		log.Fatalf("unable to parse PKCS1 private key. %v", err)
+		return nil, fmt.Errorf("unable to parse PKCS1 private key. %v", err)
 	}
 	config := oauth1.Config{
 		ConsumerKey: jiraConsumerKey,
@@ -123,14 +134,18 @@ func getJIRAClient() *jira.Client {
 			PrivateKey: privateKey,
 		},
 	}
-	jiraClient, err := jira.NewClient(getJIRAHTTPClient(ctx, &config), jiraURL)
+	httpClient, err := jiraHTTPClient(ctx, &config)
 	if err != nil {
-		log.Fatalf("unable to create new JIRA client. %v", err)
+		return nil, fmt.Errorf("unable to create new JIRA client. %v", err)
 	}
-	return jiraClient
+	jiraClient, err := jira.NewClient(httpClient, jiraURL)
+	if err != nil {
+		return nil, fmt.Errorf("unable to create new JIRA client. %v", err)
+	}
+	return jiraClient, nil
 }
 
-func GetAllIssues(client *jira.Client, searchString string) ([]jira.Issue, error) {
+func FindIssues(client *jira.Client, query string) ([]jira.Issue, error) {
 	last := 0
 	var issues []jira.Issue
 	for {
@@ -139,7 +154,7 @@ func GetAllIssues(client *jira.Client, searchString string) ([]jira.Issue, error
 			StartAt:    last,
 		}
 
-		chunk, resp, err := client.Issue.Search(searchString, opt)
+		chunk, resp, err := client.Issue.Search(query, opt)
 		if err != nil {
 			return nil, err
 		}
@@ -156,15 +171,144 @@ func GetAllIssues(client *jira.Client, searchString string) ([]jira.Issue, error
 	}
 }
 
+type baseCommand struct {
+	PrivateKeyPath string
+	ConsumerKey    string
+}
+
+func (cmdBase *baseCommand) addFlags(flagSet *flag.FlagSet) {
+	flagSet.StringVar(&cmdBase.PrivateKeyPath, "privateKeyPath", "", "")
+	flagSet.StringVar(&cmdBase.ConsumerKey, "consumerKey", "", "")
+}
+
+func (cmdBase *baseCommand) validate() error {
+	if cmdBase.ConsumerKey == "" {
+		return errors.New("'consumerKey' flag is required")
+	}
+	if cmdBase.PrivateKeyPath == "" {
+		return errors.New("'privateKeyPath' flag is required")
+	}
+	return nil
+}
+
 type branchLine struct {
 	Raw             string
 	MatchedIssueKey string
 }
 
-func main() {
+type searchCommand struct {
+	baseCommand
+}
+
+func (cmd *searchCommand) Help() string {
+	return ""
+}
+func (cmd *searchCommand) Synopsis() string {
+	return ``
+}
+
+// searchCommandFactory returns an empty searchCommand
+func searchCommandFactory() (cli.Command, error) {
+	return &searchCommand{}, nil
+}
+
+func (cmd *searchCommand) Run(args []string) int {
+	set := flag.NewFlagSet("search", flag.ExitOnError)
+	cmd.baseCommand.addFlags(set)
+	err := set.Parse(args)
+	if err != nil {
+		log.Printf("error parsing flags: %v", err)
+		return 1
+	}
+	if err := cmd.baseCommand.validate(); err != nil {
+		log.Printf("error parsing flags: %v", err)
+		return 1
+	}
+
+	if len(set.Args()) != 1 {
+		log.Printf("search string required")
+		log.Printf(cmd.Help())
+		return 1
+	}
+	searchString := set.Args()[0]
+	cli, err := jiraClient(cmd.PrivateKeyPath, cmd.ConsumerKey)
+	if err != nil {
+		log.Printf("failed to create jira client: %v", err)
+		return 1
+	}
+	issues, err := FindIssues(cli, searchString)
+	if err != nil {
+		log.Printf(fmt.Sprintf("query failed: %v", err))
+		return 1
+	}
+	out := tabwriter.NewWriter(
+		os.Stdout,
+		0,
+		0,
+		3,
+		' ',
+		0, //tabwriter.Debug,
+	)
+	headers := []string{
+		"Issue",
+		"Status",
+		"Summary",
+	}
+	dividers := []string{}
+	for _, header := range headers {
+		dividers = append(dividers, strings.Repeat("-", len(header)))
+	}
+	fmt.Fprintln(out, strings.Join(headers, "\t"))
+	fmt.Fprintln(out, strings.Join(dividers, "\t"))
+	for _, issue := range issues {
+		fmt.Fprintln(
+			out,
+			strings.Join([]string{
+				issue.Key,
+				issue.Fields.Status.Name,
+				issue.Fields.Summary,
+			}, "\t"),
+		)
+	}
+	out.Flush()
+	return 0
+
+}
+
+type ticketsCommand struct {
+	baseCommand
+}
+
+func (cmd *ticketsCommand) Help() string {
+	return ""
+}
+func (cmd *ticketsCommand) Synopsis() string {
+	return `reads "git branch" data via stdin and writes it to stdout with additional summary information about tickets in jira`
+}
+
+// ticketsCommandFactory returns an empty ticketsCommand
+func ticketsCommandFactory() (cli.Command, error) {
+	return &ticketsCommand{}, nil
+}
+
+func (cmd *ticketsCommand) Run(args []string) int {
+	set := flag.NewFlagSet("tickets", flag.ExitOnError)
+	cmd.baseCommand.addFlags(set)
+	err := set.Parse(args)
+	if err != nil {
+		log.Printf("error parsing flags: %v", err)
+		return 1
+	}
+
+	if err := cmd.baseCommand.validate(); err != nil {
+		log.Printf("error parsing flags: %v", err)
+		return 1
+	}
+
 	input, err := ioutil.ReadAll(os.Stdin)
 	if err != nil {
 		log.Fatal(err)
+		return 1
 	}
 
 	issueRegex := regexp.MustCompile(`^(\w+-\d+)(-\w+)?`)
@@ -189,11 +333,16 @@ func main() {
 
 	issuesByKey := map[string]jira.Issue{}
 	if len(issueKeys) > 0 {
-		cli := getJIRAClient()
+		cli, err := jiraClient(cmd.PrivateKeyPath, cmd.ConsumerKey)
+		if err != nil {
+			log.Printf("failed to create jira client: %v", err)
+			return 1
+		}
 		query := fmt.Sprintf("key in (%s)", strings.Join(issueKeys, ","))
-		issues, err := GetAllIssues(cli, query)
+		issues, err := FindIssues(cli, query)
 		if err != nil {
 			log.Fatal(err)
+			return 1
 		}
 		for _, issue := range issues {
 			issuesByKey[issue.Key] = issue
@@ -208,4 +357,23 @@ func main() {
 		}
 		fmt.Printf("%s\t%s\n", outputLine.Raw, matchedIssue.Fields.Summary)
 	}
+	return 0
+}
+
+func main() {
+	c := cli.NewCLI("jirautil", "1.0.0")
+	c.Args = os.Args[1:]
+	c.Commands = map[string]cli.CommandFactory{
+		"tickets": ticketsCommandFactory,
+		"search":  searchCommandFactory,
+	}
+
+	exitStatus, err := c.Run()
+	if err != nil {
+		log.Println(err)
+		os.Exit(1)
+	}
+
+	os.Exit(exitStatus)
+
 }
