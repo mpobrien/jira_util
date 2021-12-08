@@ -17,7 +17,10 @@ import (
 	"regexp"
 	"strings"
 	"text/tabwriter"
+	"time"
 
+	markdown "github.com/MichaelMure/go-term-markdown"
+	"github.com/StevenACoffman/j2m"
 	"github.com/andygrunwald/go-jira"
 	"github.com/dghubble/oauth1"
 	"github.com/mitchellh/cli"
@@ -198,6 +201,7 @@ type branchLine struct {
 
 type searchCommand struct {
 	baseCommand
+	URLColumn bool
 }
 
 func (cmd *searchCommand) Help() string {
@@ -215,6 +219,8 @@ func searchCommandFactory() (cli.Command, error) {
 func (cmd *searchCommand) Run(args []string) int {
 	set := flag.NewFlagSet("search", flag.ExitOnError)
 	cmd.baseCommand.addFlags(set)
+	set.BoolVar(&cmd.URLColumn, "urlColumn", true, "")
+
 	err := set.Parse(args)
 	if err != nil {
 		log.Printf("error parsing flags: %v", err)
@@ -261,18 +267,131 @@ func (cmd *searchCommand) Run(args []string) int {
 	fmt.Fprintln(out, strings.Join(headers, "\t"))
 	fmt.Fprintln(out, strings.Join(dividers, "\t"))
 	for _, issue := range issues {
+		issueCol := issue.Key
+		if cmd.URLColumn {
+			issueCol = fmt.Sprintf("%sbrowse/%s", jiraURL, issue.Key)
+		}
+
+		fields := []string{
+			issueCol,
+			issue.Fields.Status.Name,
+			issue.Fields.Summary,
+		}
+
 		fmt.Fprintln(
 			out,
-			strings.Join([]string{
-				issue.Key,
-				issue.Fields.Status.Name,
-				issue.Fields.Summary,
-			}, "\t"),
+			strings.Join(fields, "\t"),
 		)
 	}
 	out.Flush()
 	return 0
 
+}
+
+type ticketCommand struct {
+	baseCommand
+}
+
+func (cmd *ticketCommand) Help() string {
+	return ""
+}
+func (cmd *ticketCommand) Synopsis() string {
+	return ``
+}
+
+// ticketCommandFactory returns an empty ticketCommand
+func ticketCommandFactory() (cli.Command, error) {
+	return &ticketCommand{}, nil
+}
+
+func (cmd *ticketCommand) Run(args []string) int {
+	set := flag.NewFlagSet("tickets", flag.ExitOnError)
+	cmd.baseCommand.addFlags(set)
+	err := set.Parse(args)
+	if err != nil {
+		log.Printf("error parsing flags: %v", err)
+		return 1
+	}
+	ticketIDs := []string{}
+	for i := 0; i < set.NArg(); i++ {
+		ticketIDs = append(ticketIDs, set.Arg(i))
+	}
+
+	cli, err := jiraClient(cmd.PrivateKeyPath, cmd.ConsumerKey)
+	if err != nil {
+		log.Printf("failed to create jira client: %v", err)
+		return 1
+	}
+	query := fmt.Sprintf("key in (%s)", strings.Join(ticketIDs, ","))
+	issues, err := FindIssues(cli, query)
+	if err != nil {
+		log.Fatal(err)
+		return 1
+	}
+	issuesByKey := map[string]jira.Issue{}
+	for _, issue := range issues {
+		issuesByKey[issue.Key] = issue
+	}
+	stdoutLogger := log.New(os.Stdout, "", 0)
+	for key, issue := range issuesByKey {
+		stdoutLogger.Print()
+		stdoutLogger.Printf("%s: %s", key, issue.Fields.Summary)
+		stdoutLogger.Print()
+		stdoutLogger.Printf("Reporter: %s", StringifyUser(issue.Fields.Reporter))
+		stdoutLogger.Printf("Assignee: %s", StringifyUser(issue.Fields.Assignee))
+		stdoutLogger.Print()
+		stdoutLogger.Printf("Created: %s", time.Time(issue.Fields.Created))
+		stdoutLogger.Printf("Updated: %s", time.Time(issue.Fields.Updated))
+		stdoutLogger.Print()
+		stdoutLogger.Print("Description:")
+		descMarkdown := j2m.JiraToMD(issue.Fields.Description)
+		rendered := markdown.Render(descMarkdown, 80, 6)
+		stdoutLogger.Print(string(rendered))
+		stdoutLogger.Print()
+		//os.Stdout.WriteString(rendered)
+
+		/*
+			Expand                        string            `json:"expand,omitempty" structs:"expand,omitempty"`
+			Type                          IssueType         `json:"issuetype,omitempty" structs:"issuetype,omitempty"`
+			Project                       Project           `json:"project,omitempty" structs:"project,omitempty"`
+			Resolution                    *Resolution       `json:"resolution,omitempty" structs:"resolution,omitempty"`
+			Priority                      *Priority         `json:"priority,omitempty" structs:"priority,omitempty"`
+			Resolutiondate                Time              `json:"resolutiondate,omitempty" structs:"resolutiondate,omitempty"`
+			Created                       Time              `json:"created,omitempty" structs:"created,omitempty"`
+			Duedate                       Date              `json:"duedate,omitempty" structs:"duedate,omitempty"`
+			Watches                       *Watches          `json:"watches,omitempty" structs:"watches,omitempty"`
+			Assignee                      *User             `json:"assignee,omitempty" structs:"assignee,omitempty"`
+			Updated                       Time              `json:"updated,omitempty" structs:"updated,omitempty"`
+			Description                   string            `json:"description,omitempty" structs:"description,omitempty"`
+			Summary                       string            `json:"summary,omitempty" structs:"summary,omitempty"`
+			Creator                       *User             `json:"Creator,omitempty" structs:"Creator,omitempty"`
+			Reporter                      *User             `json:"reporter,omitempty" structs:"reporter,omitempty"`
+			Components                    []*Component      `json:"components,omitempty" structs:"components,omitempty"`
+			Status                        *Status           `json:"status,omitempty" structs:"status,omitempty"`
+			Progress                      *Progress         `json:"progress,omitempty" structs:"progress,omitempty"`
+			AggregateProgress             *Progress         `json:"aggregateprogress,omitempty" structs:"aggregateprogress,omitempty"`
+			TimeTracking                  *TimeTracking     `json:"timetracking,omitempty" structs:"timetracking,omitempty"`
+			TimeSpent                     int               `json:"timespent,omitempty" structs:"timespent,omitempty"`
+			TimeEstimate                  int               `json:"timeestimate,omitempty" structs:"timeestimate,omitempty"`
+			TimeOriginalEstimate          int               `json:"timeoriginalestimate,omitempty" structs:"timeoriginalestimate,omitempty"`
+			Worklog                       *Worklog          `json:"worklog,omitempty" structs:"worklog,omitempty"`
+			IssueLinks                    []*IssueLink      `json:"issuelinks,omitempty" structs:"issuelinks,omitempty"`
+			Comments                      *Comments         `json:"comment,omitempty" structs:"comment,omitempty"`
+			FixVersions                   []*FixVersion     `json:"fixVersions,omitempty" structs:"fixVersions,omitempty"`
+			AffectsVersions               []*AffectsVersion `json:"versions,omitempty" structs:"versions,omitempty"`
+			Labels                        []string          `json:"labels,omitempty" structs:"labels,omitempty"`
+			Subtasks                      []*Subtasks       `json:"subtasks,omitempty" structs:"subtasks,omitempty"`
+			Attachments                   []*Attachment     `json:"attachment,omitempty" structs:"attachment,omitempty"`
+			Epic                          *Epic             `json:"epic,omitempty" structs:"epic,omitempty"`
+			Sprint                        *Sprint           `json:"sprint,omitempty" structs:"sprint,omitempty"`
+			Parent                        *Parent           `json:"parent,omitempty" structs:"parent,omitempty"`
+			AggregateTimeOriginalEstimate int               `json:"aggregatetimeoriginalestimate,omitempty" structs:"aggregatetimeoriginalestimate,omitempty"`
+			AggregateTimeSpent            int               `json:"aggregatetimespent,omitempty" structs:"aggregatetimespent,omitempty"`
+			AggregateTimeEstimate         int               `json:"aggregatetimeestimate,omitempty" structs:"aggregatetimeestimate,omitempty"`
+			Unknowns                      tcontainer.MarshalMap
+		*/
+	}
+	return 0
 }
 
 type ticketsCommand struct {
@@ -360,10 +479,18 @@ func (cmd *ticketsCommand) Run(args []string) int {
 	return 0
 }
 
+func StringifyUser(user *jira.User) string {
+	if user == nil {
+		return "<None>"
+	}
+	return fmt.Sprintf("%s <%s>", user.DisplayName, user.Name)
+}
+
 func main() {
 	c := cli.NewCLI("jirautil", "1.0.0")
 	c.Args = os.Args[1:]
 	c.Commands = map[string]cli.CommandFactory{
+		"ticket":  ticketCommandFactory,
 		"tickets": ticketsCommandFactory,
 		"search":  searchCommandFactory,
 	}
