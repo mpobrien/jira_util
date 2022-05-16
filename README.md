@@ -13,7 +13,7 @@ python3 jira-token-gen.py
 
 Then follow the instructions in the terminal.
 
-Take the private key that is sent back and write it to a file.
+Take the private key that is sent back and save it to a file.
 Then the consumer key and use it in the following command:
 
 ```
