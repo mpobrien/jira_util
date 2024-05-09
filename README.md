@@ -6,6 +6,8 @@ Do the following:
 ```shell
 git clone git@github.com:10gen/iteng-jira-oauth
 cd iteng-jira-oauth
+virtualenv ./venv
+source ./venv/bin/activate
 pip3 install -r requirements.txt
 python3 jira-token-gen.py
 ```
