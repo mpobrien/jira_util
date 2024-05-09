@@ -18,4 +18,5 @@ Take the private key that is sent back and save it to a file.
 Then the consumer key and use it in the following command:
 
 ```
-jirabranch search -consumerKey <consumerKey> -privateKeyPath <path-to-PK-file> 'project = PROJECT and resolution is empty'```
+jirabranch search -consumerKey <consumerKey> -privateKeyPath <path-to-PK-file> 'project = PROJECT and resolution is empty'
+```
